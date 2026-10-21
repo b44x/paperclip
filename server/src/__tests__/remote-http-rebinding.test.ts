@@ -120,6 +120,167 @@ function rebindingLookup(): { lookup: () => Promise<Array<{ address: string; fam
 }
 
 describe("guarded remote HTTP fetch (PAP-17098 DNS rebinding)", () => {
+
+  it("uses HTTP CONNECT proxy with the approved IP and preserves the original Host header", async () => {
+    const upstream = await startServer();
+    const connectTargets: string[] = [];
+    const proxy = createServer();
+
+    proxy.on("connect", (req, clientSocket, head) => {
+      connectTargets.push(req.url ?? "");
+
+      const tunnel = netConnect({
+        host: "127.0.0.1",
+        port: upstream.port,
+      });
+
+      openSockets.push(tunnel, clientSocket as Socket);
+      clientSocket.on("error", () => undefined);
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+
+      if (head.length > 0) tunnel.write(head);
+
+      clientSocket.pipe(tunnel);
+      tunnel.pipe(clientSocket);
+    });
+
+    openServers.push(proxy);
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+
+    const proxyPort = (proxy.address() as AddressInfo).port;
+    const proxyUrl = `http://127.0.0.1:${proxyPort}`;
+    const keys = [
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "NO_PROXY",
+      "no_proxy",
+    ] as const;
+    const previous = new Map(keys.map((key) => [key, process.env[key]]));
+
+    process.env.HTTP_PROXY = proxyUrl;
+    process.env.HTTPS_PROXY = proxyUrl;
+    process.env.http_proxy = proxyUrl;
+    process.env.https_proxy = proxyUrl;
+    process.env.NO_PROXY = "";
+    process.env.no_proxy = "";
+
+    try {
+      const response = await guardedRemoteHttpFetch(
+        `http://${REBIND_HOST}/mcp`,
+        {},
+        {
+          allowPrivateNetwork: false,
+          lookup: async () => [{ address: PUBLIC_ADDRESS, family: 4 }],
+          error: guardError,
+        },
+      );
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ ok: true });
+      expect(connectTargets).toEqual([`${PUBLIC_ADDRESS}:80`]);
+      expect(upstream.requests).toEqual([
+        { url: "/mcp", host: REBIND_HOST },
+      ]);
+    } finally {
+      for (const key of keys) {
+        const value = previous.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+
+  it("uses the approved IP for HTTPS CONNECT and preserves the original TLS SNI", async () => {
+    const connectTargets: string[] = [];
+    let clientHello: Buffer | undefined;
+
+    // Capture the TLS ClientHello, then close without presenting a certificate.
+    // This verifies SNI without weakening certificate verification in the test.
+    const tlsTarget = netCreateServer((socket) => {
+      openSockets.push(socket);
+      let received = Buffer.alloc(0);
+
+      socket.on("data", (chunk) => {
+        received = Buffer.concat([received, chunk]);
+        if (received.length < 5) return;
+
+        const recordLength = 5 + received.readUInt16BE(3);
+        if (received.length >= recordLength) {
+          clientHello = Buffer.from(received.subarray(0, recordLength));
+          socket.destroy();
+        }
+      });
+      socket.on("error", () => undefined);
+    });
+
+    openServers.push(tlsTarget);
+    await new Promise<void>((resolve) => tlsTarget.listen(0, "127.0.0.1", resolve));
+    const tlsPort = (tlsTarget.address() as AddressInfo).port;
+
+    const proxy = createServer();
+    proxy.on("connect", (req, clientSocket, head) => {
+      connectTargets.push(req.url ?? "");
+
+      const tunnel = netConnect({ host: "127.0.0.1", port: tlsPort });
+      openSockets.push(tunnel, clientSocket as Socket);
+      tunnel.on("error", () => clientSocket.destroy());
+      clientSocket.on("error", () => tunnel.destroy());
+
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head.length > 0) tunnel.write(head);
+
+      clientSocket.pipe(tunnel);
+      tunnel.pipe(clientSocket);
+    });
+
+    openServers.push(proxy);
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+
+    const proxyPort = (proxy.address() as AddressInfo).port;
+    const proxyUrl = `http://127.0.0.1:${proxyPort}`;
+    const keys = [
+      "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy",
+    ] as const;
+    const previous = new Map(keys.map((key) => [key, process.env[key]]));
+
+    process.env.HTTP_PROXY = proxyUrl;
+    process.env.HTTPS_PROXY = proxyUrl;
+    process.env.http_proxy = proxyUrl;
+    process.env.https_proxy = proxyUrl;
+    process.env.NO_PROXY = "";
+    process.env.no_proxy = "";
+
+    let failure: unknown;
+    try {
+      failure = await guardedRemoteHttpFetch(
+        `https://${REBIND_HOST}/mcp`,
+        {},
+        {
+          allowPrivateNetwork: false,
+          lookup: async () => [{ address: PUBLIC_ADDRESS, family: 4 }],
+          error: guardError,
+        },
+      ).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    } finally {
+      for (const key of keys) {
+        const value = previous.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+
+    expect(failure).toBeDefined();
+    expect(connectTargets).toEqual([`${PUBLIC_ADDRESS}:443`]);
+    expect(clientHello).toBeDefined();
+    expect(clientHello?.includes(Buffer.from(REBIND_HOST))).toBe(true);
+  });
+
   it("sends a stable default User-Agent and preserves an explicit caller value", async () => {
     const seen: Array<string | undefined> = [];
     const upstream = await startServer((req, res) => {
