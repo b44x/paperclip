@@ -105,6 +105,21 @@ async function flush(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
 
+/** Returns whether a socket emitted its close event before the deadline. */
+async function socketClosesWithin(closed: Promise<void>, timeoutMs: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      closed.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** A name server that answers public first and loopback afterwards. */
 function rebindingLookup(): { lookup: () => Promise<Array<{ address: string; family: number }>>; calls: () => number } {
   let calls = 0;
@@ -120,6 +135,152 @@ function rebindingLookup(): { lookup: () => Promise<Array<{ address: string; fam
 }
 
 describe("guarded remote HTTP fetch (PAP-17098 DNS rebinding)", () => {
+  it("keeps proxy routing when NO_PROXY specifies a different port", async () => {
+    const connectTargets: string[] = [];
+    const proxy = createServer();
+    proxy.on("connect", (req, clientSocket) => {
+      connectTargets.push(req.url ?? "");
+      openSockets.push(clientSocket as Socket);
+      clientSocket.on("error", () => undefined);
+      clientSocket.end("HTTP/1.1 502 Test Proxy Rejection\r\nConnection: close\r\n\r\n");
+    });
+    openServers.push(proxy);
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+
+    const proxyPort = (proxy.address() as AddressInfo).port;
+    const proxyUrl = `http://127.0.0.1:${proxyPort}`;
+    const keys = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"] as const;
+    const previous = new Map(keys.map((key) => [key, process.env[key]]));
+    process.env.HTTP_PROXY = proxyUrl;
+    process.env.HTTPS_PROXY = proxyUrl;
+    process.env.http_proxy = proxyUrl;
+    process.env.https_proxy = proxyUrl;
+    process.env.NO_PROXY = `${REBIND_HOST}:8081`;
+    process.env.no_proxy = "";
+
+    try {
+      await expect(guardedRemoteHttpFetch(
+        `http://${REBIND_HOST}:8080/mcp`,
+        {},
+        {
+          allowPrivateNetwork: false,
+          lookup: async () => [{ address: PUBLIC_ADDRESS, family: 4 }],
+          error: guardError,
+        },
+      )).rejects.toBeDefined();
+      expect(connectTargets).toEqual([`${PUBLIC_ADDRESS}:8080`]);
+    } finally {
+      for (const key of keys) {
+        const value = previous.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it("closes the proxy socket when CONNECT times out", async () => {
+    let acceptedSocket: Socket | undefined;
+    let markAccepted!: () => void;
+    const accepted = new Promise<void>((resolve) => { markAccepted = resolve; });
+    let markSocketClosed!: () => void;
+    const socketClosed = new Promise<void>((resolve) => { markSocketClosed = resolve; });
+    const proxy = createServer();
+    proxy.on("connect", (_req, clientSocket) => {
+      acceptedSocket = clientSocket as Socket;
+      openSockets.push(acceptedSocket);
+      acceptedSocket.on("error", () => undefined);
+      acceptedSocket.once("close", () => markSocketClosed());
+      // CONNECT test sockets are upgraded sockets. Close the proxy-side writable
+      // half after the client sends EOF, so the fixture does not leak a half-open socket.
+      acceptedSocket.once("end", () => acceptedSocket?.destroy());
+      markAccepted();
+      // Intentionally leave CONNECT unanswered.
+    });
+    openServers.push(proxy);
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+
+    const proxyUrl = `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`;
+    const keys = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"] as const;
+    const previous = new Map(keys.map((key) => [key, process.env[key]]));
+    process.env.HTTP_PROXY = proxyUrl;
+    process.env.HTTPS_PROXY = proxyUrl;
+    process.env.http_proxy = proxyUrl;
+    process.env.https_proxy = proxyUrl;
+    process.env.NO_PROXY = "";
+    process.env.no_proxy = "";
+
+    try {
+      const request = guardedRemoteHttpFetch(`http://${REBIND_HOST}/mcp`, {}, {
+        allowPrivateNetwork: false,
+        lookup: async () => [{ address: PUBLIC_ADDRESS, family: 4 }],
+        error: guardError,
+        connectTimeoutMs: 150,
+      });
+      await accepted;
+      await expect(request).rejects.toBeDefined();
+      await expect(socketClosesWithin(socketClosed, 1000)).resolves.toBe(true);
+    } finally {
+      for (const key of keys) {
+        const value = previous.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it("closes the proxy socket when CONNECT is cancelled", async () => {
+    let acceptedSocket: Socket | undefined;
+    let markAccepted!: () => void;
+    const accepted = new Promise<void>((resolve) => { markAccepted = resolve; });
+    let markSocketClosed!: () => void;
+    const socketClosed = new Promise<void>((resolve) => { markSocketClosed = resolve; });
+    const proxy = createServer();
+    proxy.on("connect", (_req, clientSocket) => {
+      acceptedSocket = clientSocket as Socket;
+      openSockets.push(acceptedSocket);
+      acceptedSocket.on("error", () => undefined);
+      acceptedSocket.once("close", () => markSocketClosed());
+      // CONNECT test sockets are upgraded sockets. Close the proxy-side writable
+      // half after the client sends EOF, so the fixture does not leak a half-open socket.
+      acceptedSocket.once("end", () => acceptedSocket?.destroy());
+      markAccepted();
+      // Intentionally leave CONNECT unanswered.
+    });
+    openServers.push(proxy);
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+
+    const proxyUrl = `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`;
+    const keys = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"] as const;
+    const previous = new Map(keys.map((key) => [key, process.env[key]]));
+    process.env.HTTP_PROXY = proxyUrl;
+    process.env.HTTPS_PROXY = proxyUrl;
+    process.env.http_proxy = proxyUrl;
+    process.env.https_proxy = proxyUrl;
+    process.env.NO_PROXY = "";
+    process.env.no_proxy = "";
+
+    try {
+      const controller = new AbortController();
+      const request = guardedRemoteHttpFetch(`http://${REBIND_HOST}/mcp`, {
+        signal: controller.signal,
+      }, {
+        allowPrivateNetwork: false,
+        lookup: async () => [{ address: PUBLIC_ADDRESS, family: 4 }],
+        error: guardError,
+      });
+      await accepted;
+      controller.abort(new Error("test cancellation"));
+      await expect(request).rejects.toBeDefined();
+      await expect(socketClosesWithin(socketClosed, 1000)).resolves.toBe(true);
+    } finally {
+      for (const key of keys) {
+        const value = previous.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
 
   it("uses HTTP CONNECT proxy with the approved IP and preserves the original Host header", async () => {
     const upstream = await startServer();

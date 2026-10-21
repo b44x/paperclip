@@ -214,7 +214,7 @@ async function dialApprovedAddress(input: {
  * even a ClientHello off an internal service.
  */
 
-function configuredRemoteHttpProxy(hostname: string, useTls: boolean): URL | undefined {
+function configuredRemoteHttpProxy(hostname: string, useTls: boolean, port: number): URL | undefined {
   const normalizedHost = hostname.toLowerCase().replace(/^\[|\]$/g, "");
   const noProxy = process.env.NO_PROXY ?? process.env.no_proxy ?? "";
 
@@ -223,13 +223,25 @@ function configuredRemoteHttpProxy(hostname: string, useTls: boolean): URL | und
     if (!rule) return false;
     if (rule === "*") return true;
 
+    let rulePort: number | undefined;
     if (rule.startsWith("[")) {
       const end = rule.indexOf("]");
-      if (end >= 0) rule = rule.slice(1, end);
+      if (end < 0) return false;
+      const suffix = rule.slice(end + 1);
+      rule = rule.slice(1, end);
+      if (suffix) {
+        if (!/^:\d+$/.test(suffix)) return false;
+        rulePort = Number(suffix.slice(1));
+      }
     } else if (rule.includes(":") && rule.indexOf(":") === rule.lastIndexOf(":")) {
-      rule = rule.slice(0, rule.lastIndexOf(":"));
+      const separator = rule.lastIndexOf(":");
+      const candidatePort = rule.slice(separator + 1);
+      if (!/^\d+$/.test(candidatePort)) return false;
+      rulePort = Number(candidatePort);
+      rule = rule.slice(0, separator);
     }
 
+    if (rulePort !== undefined && rulePort !== port) return false;
     rule = rule.replace(/^\./, "");
     return normalizedHost === rule || normalizedHost.endsWith(`.${rule}`);
   });
@@ -294,6 +306,9 @@ async function establishHttpProxyTunnel(
       if (settled) return;
       settled = true;
       cleanup();
+      // This helper owns the CONNECT handshake, so close the proxy socket
+      // immediately when the handshake fails or is cancelled.
+      socket.destroy();
       reject(error);
     };
 
@@ -364,7 +379,7 @@ async function openVerifiedSocket(input: {
 
   const proxyUrl = options.socketFactory
     ? undefined
-    : configuredRemoteHttpProxy(hostname, useTls);
+    : configuredRemoteHttpProxy(hostname, useTls, port);
   const proxyHost = proxyUrl?.hostname.replace(/^\[|\]$/g, "");
 
   if (proxyUrl && (!proxyHost || isIP(proxyHost) === 0)) {
